@@ -36,22 +36,26 @@ async fn main() -> Result<()> {
         .expect("socket addr");
 
     // Configure the client and build it
-    let mut client_builder = client::Builder::default();
+    let mut client_config = quinn::ClientConfigBuilder::default();
+    client_config.enable_keylog();
+    let mut client_builder = client::Builder::with_quic_config(client_config);
     if let Some(cert) = read_cert(&ca) {
         client_builder.add_certificate_authority(cert)?;
     }
     let mut client = client_builder.build()?;
 
     // Connect and wait for handshake completion
+    info!("connecting to: {:?}", socket_addr);
     let conn = client
         .connect(&socket_addr, uri.host().unwrap_or("localhost"))?
         .await?;
 
-    let request = Request::get(uri)
+    let request = Request::get(uri.clone())
         .header("client", "quinn-h3:0.0.1")
         .body(Body::from(()))?;
 
     // Send the request
+    info!("sending request");
     let (send_data, recv_response) = conn.send_request(request);
     send_data.await?;
     // Wait for the response
@@ -60,8 +64,16 @@ async fn main() -> Result<()> {
     info!("received response: {:?}", response);
 
     // Stream the response body into a vec
-    let body = response.body_mut().read_to_end().await?;
-    info!("received body: {}", String::from_utf8_lossy(&body));
+    let body = &response.body_mut().read_to_end().await?;
+    info!("received body length: {}", body.len());
+
+    use std::io::Write;
+    let path = &uri.path()[1..];
+    let mut buffer = std::fs::File::create(path)?;
+    let mut pos = 0;
+    while pos < body.len() {
+        pos += buffer.write(&body[pos..])?;
+    }
 
     // Get the trailers if any
     if let Some(trailers) = response.body_mut().trailers().await? {

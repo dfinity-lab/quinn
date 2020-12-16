@@ -1,8 +1,9 @@
-use std::{fs, io, net::SocketAddr, path::PathBuf};
+use std::{fs, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use futures::StreamExt;
-use http::{Response, StatusCode};
+use http::{Request, Response, StatusCode};
 use quinn::{CertificateChain, PrivateKey};
 use structopt::{self, StructOpt};
 use tracing::{error, info};
@@ -13,6 +14,15 @@ use quinn_h3::{
     server::{self, RecvRequest},
     Body,
 };
+
+const EXPECTED_RTT_MS: u64 = 170;
+// Window size needed to avoid pipeline stalls
+const MAX_STREAM_BANDWIDTH_BYTES: u64 = 5 << 20;
+const STREAM_RWND: u64 = MAX_STREAM_BANDWIDTH_BYTES / 1000 * EXPECTED_RTT_MS;
+
+const INITIAL_WINDOW: u64 = STREAM_RWND;
+const MINIMUM_WINDOW: u64 = STREAM_RWND / 8;
+const LOSS_REDUCTION_FACTOR: f32 = 0.75;
 
 #[derive(StructOpt, Debug, Clone)]
 #[structopt(name = "h3_server")]
@@ -26,6 +36,21 @@ struct Opt {
     /// Address to listen on
     #[structopt(long = "listen", default_value = "[::]:4433")]
     listen: SocketAddr,
+    /// Domain for generated self-signed certificate
+    #[structopt(long, default_value = "localhost")]
+    domain: String,
+    /// Receive window
+    #[structopt(long)]
+    rwnd: Option<u64>,
+    /// Initial window
+    #[structopt(long)]
+    initial_wnd: Option<u64>,
+    /// Minimum window
+    #[structopt(long)]
+    min_wnd: Option<u64>,
+    /// Loss reduction factor
+    #[structopt(long)]
+    loss_reduction_factor: Option<f32>,
 }
 
 #[tokio::main]
@@ -38,11 +63,28 @@ async fn main() -> Result<()> {
             )
             .finish(),
     )?;
-    let opt = Opt::from_args();
-    let (cert, key) = build_certs(&opt.key, &opt.cert).expect("failed to build certs");
+    let opt: Opt = Opt::from_args();
+    let (cert, key) = build_certs(&opt.key, &opt.cert, &opt.domain).expect("failed to build certs");
+
+    let mut congestion_controller = quinn_proto::congestion::NewRenoConfig::default();
+    congestion_controller
+        .initial_window(opt.initial_wnd.unwrap_or(INITIAL_WINDOW))
+        .minimum_window(opt.min_wnd.unwrap_or(MINIMUM_WINDOW))
+        .loss_reduction_factor(opt.loss_reduction_factor.unwrap_or(LOSS_REDUCTION_FACTOR));
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config
+        .max_idle_timeout(Some(Duration::from_secs(30)))?
+        .stream_receive_window(opt.rwnd.unwrap_or(STREAM_RWND))?
+        .send_window(4 * opt.rwnd.unwrap_or(STREAM_RWND))
+        .keep_alive_interval(Some(Duration::from_secs(20)))
+        .congestion_controller_factory(Arc::new(congestion_controller));
+    let mut server_config = quinn::ServerConfig::default();
+    server_config.transport = Arc::new(transport_config);
+    let mut server_config = quinn::ServerConfigBuilder::new(server_config);
+    server_config.enable_keylog();
 
     // Configure a server endpoint
-    let mut server = server::Builder::default();
+    let mut server = server::Builder::with_quic_config(server_config);
     server
         .listen(opt.listen)
         .certificate(cert, key)
@@ -81,15 +123,26 @@ async fn main() -> Result<()> {
 
 async fn handle_request(recv_request: RecvRequest) -> Result<()> {
     // Receive the request's headers
-    let (request, mut sender) = recv_request.await?;
+    let (request, mut sender): (Request<_>, _) = recv_request.await?;
     info!("received request: {:?}", request);
+    let path = &request.uri().path()[1..];
+    let contents = std::fs::read(path);
+    let content_len = contents.as_ref().map_or(0, |contents| contents.len());
 
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header("response", "header")
-        .body(Body::from("Greetings over HTTP/3"))?;
+    let response = match contents {
+        Ok(contents) => Response::builder()
+            .status(StatusCode::OK)
+            .header("response", "header")
+            .body(Body::from(Bytes::from(contents)))?,
+
+        Err(e) => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("response", "header")
+            .body(Body::from(e.to_string().as_str()))?,
+    };
 
     sender.send_response(response).await?;
+    info!("sent response, length: {}", content_len);
 
     Ok(())
 }
@@ -97,11 +150,14 @@ async fn handle_request(recv_request: RecvRequest) -> Result<()> {
 pub fn build_certs(
     key: &Option<PathBuf>,
     cert: &Option<PathBuf>,
+    domain: &str,
 ) -> Result<(CertificateChain, PrivateKey)> {
     if let (Some(ref key_path), Some(ref cert_path)) = (key, cert) {
         let key = fs::read(key_path).context("failed to read private key")?;
+        info!("key.der = {:?}", key);
         let key = quinn::PrivateKey::from_der(&key)?;
         let cert_chain = fs::read(cert_path).context("failed to read certificate chain")?;
+        info!("cert.der = {:?}", cert_chain);
         let cert = quinn::Certificate::from_der(&cert_chain)?;
         let cert_chain = quinn::CertificateChain::from_certs(vec![cert]);
         Ok((cert_chain, key))
@@ -114,7 +170,7 @@ pub fn build_certs(
             Ok(x) => x,
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
                 info!("generating self-signed certificate");
-                let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+                let cert = rcgen::generate_simple_self_signed(vec![domain.into()]).unwrap();
                 let key = cert.serialize_private_key_der();
                 let cert = cert.serialize_der().unwrap();
                 fs::create_dir_all(&path).context("failed to create certificate directory")?;
