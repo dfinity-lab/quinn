@@ -8,7 +8,6 @@ description = "QUIC transport protocol implementation for Tokio"
 readme = "../README.md"
 keywords = ["quic"]
 categories = [ "network-programming", "asynchronous" ]
-workspace = ".."
 edition = "2018"
 
 [package.metadata.docs.rs]
